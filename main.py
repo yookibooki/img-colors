@@ -3,20 +3,66 @@ from PIL import Image
 import streamlit as st
 
 
-def analyze_mixing(arr, color1, color2, threshold):
+def _dist_to(flat, color):
+    return np.linalg.norm(flat - np.array(color, dtype=float), axis=1)
+
+
+def _otsu(values):
+    """Otsu's threshold split on a 1-D array; peak of between-class variance."""
+    hist, edges = np.histogram(values, bins=256)
+    center = (edges[:-1] + edges[1:]) / 2
+    total = values.size
+    sum_total = (hist * center).sum()
+    wB = np.cumsum(hist)
+    sumB = np.cumsum(hist * center)
+    wF = total - wB
+    sumF = sum_total - sumB
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mB = sumB / wB
+        mF = sumF / wF
+        between = wB * wF * (mB - mF) ** 2
+    return float(center[np.nanargmax(between)])
+
+
+def detect_background(arr, buckets=16):
+    """Boolean mask of background pixels.
+
+    Works for any uniform background (white, grey, …): takes the modal
+    colour as the background and splits background vs. gum with Otsu on
+    the distance to it, so no fixed 'near-white' assumption is needed.
+    """
+    flat = arr.reshape(-1, 3).astype(float)
+    B = buckets
+    q = np.floor(flat * B / 256).astype(np.int64)  # quantize to B levels/channel
+    q = np.clip(q, 0, B - 1)
+    codes = q[:, 0] * (B * B) + q[:, 1] * B + q[:, 2]
+    uniq, counts = np.unique(codes, return_counts=True)
+    code = uniq[counts.argmax()]  # most frequent = uniform background
+    bin_ = np.array([code // (B * B),
+                     (code // B) % B,
+                     code % B], dtype=float)
+    bg_color = (bin_ + 0.5) * (256 / B)  # dequantized centre of the modal bin
+    d = _dist_to(flat, bg_color)
+    thr = _otsu(d)
+    return d <= thr
+
+
+def analyze_mixing(arr, color1, color2, threshold, bg_mask=None):
     """Classify each non-background pixel as color1, color2 or mixed.
 
     A pixel is unmixed when its distance to the nearer reference color is
-    under the threshold; otherwise it counts as mixed.
+    under the threshold; otherwise it counts as mixed. When `bg_mask` is
+    not given it falls back to a near-white background heuristic.
     """
     flat = arr.reshape(-1, 3).astype(float)
+    if bg_mask is None:
+        bg_mask = flat.mean(axis=1) > 235
+    bg_mask = np.asarray(bg_mask, bool).reshape(-1)
     c1 = np.array(color1, dtype=float)
     c2 = np.array(color2, dtype=float)
 
-    brightness = flat.mean(axis=1)
-    bg_mask = brightness > 235  # white background
-
-    d1 = np.linalg.norm(flat - c1, axis=1)
+    d1 = _dist_to(flat, c1)
+    d2 = _dist_to(flat, c2)
     d2 = np.linalg.norm(flat - c2, axis=1)
 
     c1_mask = (~bg_mask) & (d1 < threshold) & (d1 <= d2)
@@ -41,29 +87,31 @@ def analyze_mixing(arr, color1, color2, threshold):
     }
 
 
-def find_reference_colors(arr, bg=235, k=2):
-    """Auto-detect the two unmixed gum colors from the photo.
+def find_reference_colors(arr, bg_mask, k=2):
+    """Auto-detect the two unmixed gum colours from the photo.
 
     Runs k-means on the non-background pixels, seeded by the two most
-    frequent quantized colors, so it adapts to the shot's lighting.
+    frequent quantized colours, so it adapts to the shot's lighting.
+    Returns colour1 (redder) and colour2, or [] if no gum is found.
     """
     flat = arr.reshape(-1, 3).astype(float)
-    brightness = flat.mean(axis=1)
-    fg = flat[brightness <= bg]
+    mask = np.asarray(bg_mask, bool).reshape(-1)
+    fg = flat[~mask]
     if len(fg) < 10:
-        return None
+        return []
 
-    # Seeds: two most frequent 16-level quantized colors, second far from first.
-    q = (fg // 16).astype(np.int64)
-    codes = q[:, 0] * 256 + q[:, 1] * 16 + q[:, 2]
+    # Seeds: two most frequent 16-level quantized colours, second far from first.
+    B = 16
+    q = (fg // B).astype(np.int64)
+    codes = q[:, 0] * (B * B) + q[:, 1] * B + q[:, 2]
     uniq, counts = np.unique(codes, return_counts=True)
     order = np.argsort(-counts)
 
     seeds = []
     for idx in order:
-        c = np.array([(uniq[idx] // 256) * 16 + 8,
-                      ((uniq[idx] // 16) % 16) * 16 + 8,
-                      (uniq[idx] % 16) * 16 + 8], dtype=float)
+        c = np.array([(uniq[idx] // (B * B)) * B + B // 2,
+                      ((uniq[idx] // B) % B) * B + B // 2,
+                      (uniq[idx] % B) * B + B // 2], dtype=float)
         if not seeds or np.linalg.norm(c - seeds[0]) > 48:
             seeds.append(c)
         if len(seeds) == k:
@@ -72,14 +120,15 @@ def find_reference_colors(arr, bg=235, k=2):
         seeds.append(np.array([0.0, 0.0, 0.0]))
 
     centers = np.asarray(seeds, dtype=float)
+
+    # Sort so colour1 reads as the redder one, colour2 the greener.
+    order = np.argsort([-(c[0] - (c[1] + c[2]) / 2) for c in centers])
+    centers = centers[order]
+
     rng = np.random.default_rng(0)
     max_pts = 4000
     sample = fg if len(fg) <= max_pts else fg[rng.choice(len(fg), max_pts, replace=False)]
 
-    # Sort so color1 reads as the redder one, color2 the greener.
-    order = np.argsort([-(c[0] - (c[1] + c[2]) / 2) for c in centers])
-
-    centers = centers[order]
     for _ in range(12):
         dist = np.sum((sample[:, None, :] - centers[None, :, :]) ** 2, axis=2)
         label = dist.argmin(axis=1)
@@ -87,7 +136,8 @@ def find_reference_colors(arr, bg=235, k=2):
                        for i in range(k)]
         new_centers = np.asarray(new_centers)
         if np.allclose(new_centers, centers, atol=0.5):
-            return new_centers.astype(int).tolist()
+            centers = new_centers
+            break
         centers = new_centers
     return centers.astype(int).tolist()
 
@@ -108,15 +158,16 @@ if max(img.size) > max_dim:
     img = img.resize((int(img.width * ratio), int(img.height * ratio)))
 arr = np.array(img)
 
-refs = find_reference_colors(arr)
-if refs is None:
-    st.error("Rasmda saqich topilmadi — ochiq fonga tushgan wafer rasmini yuklang.")
+bg_mask = detect_background(arr)
+refs = find_reference_colors(arr, bg_mask)
+if len(refs) < 2:
+    st.error("Saqich topilmadi — saqich oqqa-kulrang fon ustida ikki rangda yuklangan rasmini yuklang.")
     st.stop()
 
 color1, color2 = refs
 threshold = min(0.5 * np.linalg.norm(np.array(color1) - np.array(color2)), 150.0)
 
-result = analyze_mixing(arr, color1, color2, threshold)
+result = analyze_mixing(arr, color1, color2, threshold, bg_mask=bg_mask)
 
 col3a, col3b = st.columns(2)
 with col3a:
