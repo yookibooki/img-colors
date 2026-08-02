@@ -1,16 +1,20 @@
 import numpy as np
 from PIL import Image
 import streamlit as st
-from streamlit_image_coordinates import streamlit_image_coordinates
 
 
 def analyze_mixing(arr, color1, color2, threshold):
+    """Classify each non-background pixel as color1, color2 or mixed.
+
+    A pixel is unmixed when its distance to the nearer reference color is
+    under the threshold; otherwise it counts as mixed.
+    """
     flat = arr.reshape(-1, 3).astype(float)
     c1 = np.array(color1, dtype=float)
     c2 = np.array(color2, dtype=float)
 
     brightness = flat.mean(axis=1)
-    bg_mask = brightness > 235  # oq fon (wafer tashqarisi)
+    bg_mask = brightness > 235  # white background
 
     d1 = np.linalg.norm(flat - c1, axis=1)
     d2 = np.linalg.norm(flat - c2, axis=1)
@@ -37,15 +41,60 @@ def analyze_mixing(arr, color1, color2, threshold):
     }
 
 
+def find_reference_colors(arr, bg=235, k=2):
+    """Auto-detect the two unmixed gum colors from the photo.
+
+    Runs k-means on the non-background pixels, seeded by the two most
+    frequent quantized colors, so it adapts to the shot's lighting.
+    """
+    flat = arr.reshape(-1, 3).astype(float)
+    brightness = flat.mean(axis=1)
+    fg = flat[brightness <= bg]
+    if len(fg) < 10:
+        return None
+
+    # Seeds: two most frequent 16-level quantized colors, second far from first.
+    q = (fg // 16).astype(np.int64)
+    codes = q[:, 0] * 256 + q[:, 1] * 16 + q[:, 2]
+    uniq, counts = np.unique(codes, return_counts=True)
+    order = np.argsort(-counts)
+
+    seeds = []
+    for idx in order:
+        c = np.array([(uniq[idx] // 256) * 16 + 8,
+                      ((uniq[idx] // 16) % 16) * 16 + 8,
+                      (uniq[idx] % 16) * 16 + 8], dtype=float)
+        if not seeds or np.linalg.norm(c - seeds[0]) > 48:
+            seeds.append(c)
+        if len(seeds) == k:
+            break
+    while len(seeds) < k:
+        seeds.append(np.array([0.0, 0.0, 0.0]))
+
+    centers = np.asarray(seeds, dtype=float)
+    rng = np.random.default_rng(0)
+    max_pts = 4000
+    sample = fg if len(fg) <= max_pts else fg[rng.choice(len(fg), max_pts, replace=False)]
+
+    # Sort so color1 reads as the redder one, color2 the greener.
+    order = np.argsort([-(c[0] - (c[1] + c[2]) / 2) for c in centers])
+
+    centers = centers[order]
+    for _ in range(12):
+        dist = np.sum((sample[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+        label = dist.argmin(axis=1)
+        new_centers = [sample[label == i].mean(axis=0) if np.any(label == i) else centers[i]
+                       for i in range(k)]
+        new_centers = np.asarray(new_centers)
+        if np.allclose(new_centers, centers, atol=0.5):
+            return new_centers.astype(int).tolist()
+        centers = new_centers
+    return centers.astype(int).tolist()
+
+
 st.set_page_config(page_title="Aralashish tahlili", layout="wide")
 st.title("Ikki rangli saqich testi")
 st.caption("Aralashish = 1 − (aralashmagan piksellar / jami piksellar) — Schimmel va boshq., 2007")
-
-if "color1" not in st.session_state:
-    st.session_state.color1 = None
-    st.session_state.color2 = None
-    st.session_state.picking = 1
-    st.session_state.last_coords = None
 
 uploaded = st.file_uploader("Chaynalgan saqich (wafer) rasmi", type=["jpg", "jpeg", "png"])
 if uploaded is None:
@@ -59,67 +108,24 @@ if max(img.size) > max_dim:
     img = img.resize((int(img.width * ratio), int(img.height * ratio)))
 arr = np.array(img)
 
-def _swatch_html(rgb):
-    if rgb is None:
-        return '<div style="width:34px;height:34px;border-radius:50%;border:2px dashed #999;display:inline-block"></div>'
-    r, g, b = (int(c) for c in rgb)
-    return (f'<div style="width:34px;height:34px;border-radius:50%;'
-            f'background:rgb({r},{g},{b});border:2px solid #555;display:inline-block"></div>')
+refs = find_reference_colors(arr)
+if refs is None:
+    st.error("Rasmda saqich topilmadi — ochiq fonga tushgan wafer rasmini yuklang.")
+    st.stop()
 
-col1, col2 = st.columns([3, 2])
+color1, color2 = refs
+threshold = min(0.5 * np.linalg.norm(np.array(color1) - np.array(color2)), 150.0)
 
-with col1:
-    if st.session_state.color1 is None:
-        st.info("**1-qadam:** rasmida *birinchi kolori* (masalan qirmizi) turgan joyiga **bosing**.")
-        st.write("Rasm ustiga bosing — o'sha nuqtnaning rangi 1-rang qilib olinadi.")
-    elif st.session_state.color2 is None:
-        st.success("1-rang tanlangdi ✅. Endi 2-qadam:")
-        st.info("**2-qadam:** rasmida *ikkinchi kolori* (masalan yashil) turgan joyiga **bosing**.")
-    else:
-        st.success("Ikkala rang tanlandi ✅")
+result = analyze_mixing(arr, color1, color2, threshold)
 
-    coords = streamlit_image_coordinates(img, key="pic")
-    if coords and coords != st.session_state.last_coords:
-        st.session_state.last_coords = coords
-        x, y = int(coords["x"]), int(coords["y"])
-        picked = arr[y, x].tolist()
-        if st.session_state.color1 is None:
-            st.session_state.color1 = picked
-        else:
-            st.session_state.color2 = picked
-        st.rerun()
+col3a, col3b = st.columns(2)
+with col3a:
+    st.image(img, caption="Asl rasm")
+with col3b:
+    st.image(result["overlay"], caption="Tasnif natijasi")
 
-with col2:
-    st.subheader("Tanlangan ranglar")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(_swatch_html(st.session_state.color1), unsafe_allow_html=True)
-        st.caption("1-rang")
-    with c2:
-        st.markdown(_swatch_html(st.session_state.color2), unsafe_allow_html=True)
-        st.caption("2-rang")
-    if st.session_state.color1 is not None and st.session_state.color2 is not None:
-        if st.button("♻️ Qayta boshlash"):
-            st.session_state.color1 = None
-            st.session_state.color2 = None
-            st.session_state.last_coords = coords  # widget value persists on rerun; mark it old to ignore
-            st.rerun()
-
-threshold = st.slider("Sezuvchanlik (rang farqi chegarasi)", 10, 150, 60)
-
-if st.session_state.color1 is not None and st.session_state.color2 is not None:
-    result = analyze_mixing(arr, st.session_state.color1, st.session_state.color2, threshold)
-
-    col3a, col3b = st.columns(2)
-    with col3a:
-        st.image(img, caption="Asl rasm")
-    with col3b:
-        st.image(result["overlay"], caption="Tasnif natijasi")
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Aralashish darajasi", f"{result['mixing_ability']*100:.1f}%")
-    m2.metric("Sof 1-rang", f"{result['pct_color1']*100:.1f}%")
-    m3.metric("Sof 2-rang", f"{result['pct_color2']*100:.1f}%")
-    m4.metric("Aralash", f"{result['pct_mixed']*100:.1f}%")
-else:
-    st.info("Ikkala rang tanlanmaguncha natija hisoblanmaydi.")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Aralashish darajasi", f"{result['mixing_ability']*100:.1f}%")
+m2.metric("Sof 1-rang", f"{result['pct_color1']*100:.1f}%")
+m3.metric("Sof 2-rang", f"{result['pct_color2']*100:.1f}%")
+m4.metric("Aralash", f"{result['pct_mixed']*100:.1f}%")
